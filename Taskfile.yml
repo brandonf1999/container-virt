@@ -1,0 +1,147 @@
+version: "3"
+
+vars:
+  REGISTRY:           "{{.REGISTRY | default `registry.foos.net:5000`}}"
+  IMAGE_NAME:         "{{.IMAGE_NAME | default `virtlab-backend`}}"
+  IMAGE_TAG:          "{{.IMAGE_TAG | default `latest`}}"
+
+  IMAGE:              "{{.REGISTRY}}/{{.IMAGE_NAME}}:{{.IMAGE_TAG}}"
+  DEV_IMAGE:          "{{.REGISTRY}}/{{.IMAGE_NAME}}-dev:{{.IMAGE_TAG}}"
+
+  CONTAINER:          "{{.CONTAINER | default `virtlab-backend`}}"
+  DEV_CONTAINER:      "{{.DEV_CONTAINER | default `virtlab-backend-dev`}}"
+
+  HOST_PORT:          "{{.HOST_PORT | default `8000`}}"
+  DEV_PORT:           "{{.DEV_PORT | default `8000`}}"
+
+  CONTEXT:            "{{.CONTEXT | default `.`}}"
+  CONTAINERFILE:      "{{.CONTAINERFILE | default `Containerfile`}}"
+
+  SSH_DIR:            "{{.SSH_DIR | default `.ssh`}}"
+  APP_SRC:            "{{.APP_SRC | default `./virt-app`}}"
+
+includes:
+  local:
+    taskfile: Taskfile.local.yml
+    optional: true
+
+silent: false
+
+tasks:
+  build:
+    desc: Build production image with buildah bud
+    cmds:
+      - |
+        set -euo pipefail
+        echo "Building backend image: {{.IMAGE}}"
+        buildah bud \
+          --layers \
+          --target prod \
+          -t {{.IMAGE}} \
+          -f {{.CONTAINERFILE}} {{.CONTEXT}}
+
+  push:
+    desc: Push production image to registry
+    deps: [build]
+    cmds:
+      - |
+        set -euo pipefail
+        echo "Pushing image to {{.REGISTRY}}"
+        buildah push {{.IMAGE}}
+
+  up:
+    desc: Run backend container with Podman (production image)
+    deps: [build]
+    cmds:
+      - |
+        set -euo pipefail
+        podman rm -f {{.CONTAINER}} >/dev/null 2>&1 || true
+        echo "Starting backend at http://localhost:{{.HOST_PORT}}"
+        podman run -d --name {{.CONTAINER}} \
+          -p {{.HOST_PORT}}:8000 \
+          -v {{.SSH_DIR}}:/home/virt/.ssh:Z,U \
+          {{.IMAGE}}
+        echo "Backend listening on http://localhost:{{.HOST_PORT}}"
+
+  down:
+    desc: Stop backend container
+    cmds:
+      - podman rm -f {{.CONTAINER}} >/dev/null 2>&1 || true
+
+  restart:
+    desc: Restart backend container
+    cmds:
+      - task: down
+      - task: up
+
+  logs:
+    desc: Tail backend logs
+    cmds:
+      - podman logs -f {{.CONTAINER}}
+
+  dev:build:
+    desc: Build development image (dev target) with buildah bud
+    cmds:
+      - |
+        set -euo pipefail
+        echo "Building backend dev image: {{.DEV_IMAGE}}"
+        buildah bud \
+          --layers \
+          --target dev \
+          -t {{.DEV_IMAGE}} \
+          -f {{.CONTAINERFILE}} {{.CONTEXT}}
+
+  dev:up:
+    desc: Run development container with live code mount
+    deps: [dev:build]
+    cmds:
+      - |
+        set -euo pipefail
+        podman rm -f {{.DEV_CONTAINER}} >/dev/null 2>&1 || true
+        echo "Starting backend dev container on http://localhost:{{.DEV_PORT}}"
+        podman run -d --name {{.DEV_CONTAINER}} \
+          -p {{.DEV_PORT}}:8000 \
+          -v {{.APP_SRC}}:/opt/virt-app/app:Z \
+          -v {{.SSH_DIR}}:/home/virt/.ssh:Z,U \
+          {{.DEV_IMAGE}}
+        echo "Dev API listening on http://localhost:{{.DEV_PORT}}"
+
+  dev:down:
+    desc: Stop development container
+    cmds:
+      - podman rm -f {{.DEV_CONTAINER}} >/dev/null 2>&1 || true
+
+  dev:restart:
+    desc: Restart development container
+    cmds:
+      - task: dev:down
+      - task: dev:up
+
+  dev:logs:
+    desc: Tail development logs
+    cmds:
+      - podman logs -f {{.DEV_CONTAINER}}
+
+  dev:shell:
+    desc: Start an interactive shell in the dev image with code mounted
+    deps: [dev:build]
+    interactive: true
+    cmds:
+      - podman run --rm -it \
+          -p {{.DEV_PORT}}:8000 \
+          -v {{.APP_SRC}}:/opt/virt-app/app:Z \
+          -v {{.SSH_DIR}}:/home/virt/.ssh:Z,U \
+          {{.DEV_IMAGE}} bash
+
+  clean:
+    desc: Remove running containers and prune dangling images
+    cmds:
+      - podman rm -f {{.CONTAINER}} {{.DEV_CONTAINER}} >/dev/null 2>&1 || true
+      - buildah images -q --filter dangling=true | xargs -r buildah rmi || true
+
+  nuke:
+    desc: Clean containers and remove build caches (force)
+    cmds:
+      - task: clean
+      - buildah rm --all >/dev/null 2>&1 || true
+      - buildah rmi --all >/dev/null 2>&1 || true

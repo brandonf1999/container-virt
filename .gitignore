@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# Testing / coverage
+.coverage
+.coverage.*
+.pytest_cache/
+.tox/
+.nox/
+htmlcov/
+.mypy_cache/
+.pyre/
+
+# Logs and local state
+*.log
+*.pid
+*.sqlite3
+instance/
+.cache/
+
+# Tooling
+.idea/
+.vscode/
+.spyproject/
+*.code-workspace
+
+# Secrets / environment overrides
+.env
+.env.*
+!.env.example
+.ssh/
+
+# Misc
+.DS_Store
+Thumbs.db

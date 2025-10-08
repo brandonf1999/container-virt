@@ -1,0 +1,20 @@
+# libvirt cluster configuration
+
+cors:
+  allow_origins:
+    - "http://localhost:5173"
+    - "http://127.0.0.1:5173"
+    - "http://localhost:8080"
+    - "http://127.0.0.1:8080"
+    - "http://virtlab.foos.net"
+  allow_credentials: true
+  allow_methods: ["*"]
+  allow_headers: ["*"]
+
+hosts:
+  - hostname: virt0001.foos.net
+    user: admin
+    ssh:
+      known_hosts_verify: ignore
+
+
