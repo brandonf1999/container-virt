@@ -1,4 +1,4 @@
-# container-virt
+# Virtlab Backend
 
 FastAPI service for managing libvirt virtualization hosts over SSH. The API powers virtlab's guest lifecycle, console streaming, and cluster inventory features. This repository packages the app for both local development and containerized deployment.
 
