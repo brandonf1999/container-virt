@@ -85,5 +85,3 @@ All container targets expect an `.ssh/` directory alongside the Taskfile. Podman
 - `podman logs virtlab-backend` (or `virtlab-backend-dev`) shows API logs with tunnel + libvirt diagnostics
 - The activity log endpoints capture console/VNC events for debugging session setup
 - If SSH tunnels stall, verify the key permissions and adjust `ssh` options in `config.yaml`
-
-For more details on contributing, follow the repository guidelines in the project root.
