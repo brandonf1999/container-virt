@@ -190,8 +190,13 @@ class GuestVolumeSpec(BaseModel):
     @model_validator(mode="after")
     def _check_volume(self) -> "GuestVolumeSpec":
         if self.type == "disk":
-            if not self.source_path and (self.size_mb is None or self.size_mb <= 0):
-                raise ValueError("Disk volumes must include size_mb when source_path is not provided")
+            has_external_source = bool(self.source_path or self.source_volume)
+            if self.size_mb is not None and self.size_mb <= 0:
+                raise ValueError("Disk volume size_mb must be positive when provided")
+            if not has_external_source and (self.size_mb is None or self.size_mb <= 0):
+                raise ValueError(
+                    "Disk volumes must include size_mb when source_path or source_volume is not provided"
+                )
         if self.type == "iso":
             if not self.source_path and not self.source_volume:
                 raise ValueError("ISO volumes must specify source_path or source_volume")

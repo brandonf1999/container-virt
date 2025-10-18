@@ -703,7 +703,7 @@ class LibvirtHost:
         )
 
     @staticmethod
-    def _generate_vnc_password(length: int = 16) -> str:
+    def _generate_vnc_password(length: int = 8) -> str:
         alphabet = string.ascii_letters + string.digits
         return "".join(secrets.choice(alphabet) for _ in range(max(length, 8)))
 
@@ -970,6 +970,23 @@ class LibvirtHost:
             volume = pool.storageVolLookupByName(volume_name)
             return volume.path()
 
+        def _volume_format(pool: libvirt.virStoragePool, volume_name: str) -> Optional[str]:
+            try:
+                volume = pool.storageVolLookupByName(volume_name)
+            except libvirt.libvirtError:
+                return None
+            try:
+                xml_desc = volume.XMLDesc(0)
+                root = ET.fromstring(xml_desc)
+            except (libvirt.libvirtError, ET.ParseError):
+                return None
+            driver = root.find("./target/format")
+            if driver is not None:
+                fmt = driver.get("type")
+                if fmt:
+                    return fmt.lower()
+            return None
+
         try:
             for index, spec in enumerate(volumes):
                 vol_type = spec.get("type", "disk")
@@ -1001,9 +1018,22 @@ class LibvirtHost:
                     continue
 
                 existing_path = spec.get("source_path")
+                source_volume_name = spec.get("source_volume")
+                if existing_path and source_volume_name:
+                    raise StorageError(
+                        f"Disk volume '{vol_name}' cannot specify both source_path and source_volume"
+                    )
                 if existing_path:
                     path = existing_path
                     fmt = (spec.get("format") or "qcow2").lower()
+                elif source_volume_name:
+                    try:
+                        path = _volume_path(pool, source_volume_name)
+                    except libvirt.libvirtError as exc:
+                        raise StorageError(
+                            f"Source volume '{source_volume_name}' not found in pool '{pool_name}': {exc}"
+                        ) from exc
+                    fmt = (spec.get("format") or _volume_format(pool, source_volume_name) or "qcow2").lower()
                 else:
                     size_mb = spec.get("size_mb")
                     if size_mb is None or size_mb <= 0:
@@ -1125,6 +1155,10 @@ class LibvirtHost:
                     f"{key}='{escape(str(value))}'" for key, value in graphics_attrs.items()
                 )
                 devices_xml_parts.append(f"<graphics {attr_text}/>")
+            devices_xml_parts.append("<controller type='virtio-serial'/>")
+            devices_xml_parts.append(
+                "<channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>"
+            )
             devices_xml_parts.append(
                 "<console type='pty'><target type='serial' port='0'/></console>"
             )
@@ -1412,7 +1446,7 @@ class LibvirtHost:
         vnc_enabled = graphics_node is not None
         clone_vnc_password: Optional[str] = None
         if vnc_enabled:
-            clone_vnc_password = self._generate_vnc_password(16)
+            clone_vnc_password = self._generate_vnc_password(8)
 
         volume_payload = disk_specs + cd_specs
 
@@ -2200,6 +2234,39 @@ class LibvirtHost:
                         metrics["uptime_seconds"] = round(cpu_time_seconds / max(vcpus, 1), 2)
                 if metrics:
                     entry["metrics"] = metrics
+
+                guest_agent_ips: List[str] = []
+                addresses = None
+                try:
+                    is_active = bool(domain.isActive())
+                except libvirt.libvirtError:
+                    is_active = False
+                if is_active:
+                    try:
+                        addresses = domain.interfaceAddresses(
+                            getattr(libvirt, "VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT", 0),
+                            0,
+                        )
+                    except libvirt.libvirtError:
+                        try:
+                            addresses = domain.interfaceAddresses(
+                                getattr(libvirt, "VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE", 0),
+                                0,
+                            )
+                        except libvirt.libvirtError:
+                            addresses = None
+                if isinstance(addresses, dict):
+                    for iface in addresses.values():
+                        addrs = iface.get("addrs") if isinstance(iface, dict) else None
+                        if isinstance(addrs, list):
+                            for addr in addrs:
+                                if not isinstance(addr, dict):
+                                    continue
+                                ip_addr = addr.get("addr")
+                                if isinstance(ip_addr, str) and ip_addr:
+                                    guest_agent_ips.append(ip_addr)
+                if guest_agent_ips:
+                    entry["guest_agent_ips"] = guest_agent_ips
                 vm_entries.append(entry)
             except libvirt.libvirtError as exc:
                 logger.debug("Failed to inspect VM %s on %s: %s", name, self.hostname, exc)
