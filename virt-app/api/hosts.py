@@ -8,7 +8,7 @@ import socket
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -37,6 +37,29 @@ router = APIRouter(prefix="/hosts", tags=["Hosts"])
 _CONSOLE_SESSION_TTL_SECONDS = 300
 _CONSOLE_SESSIONS: Dict[str, Dict[str, object]] = {}
 _CONSOLE_SESSIONS_LOCK = asyncio.Lock()
+
+
+def _get_required_host(cluster, hostname: str):
+    host = cluster.hosts.get(hostname)
+    if not host:
+        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
+    return host
+
+
+def _ensure_host_connection(host, hostname: str, *, error_status: int = 500) -> None:
+    if host.conn:
+        return
+    if not host.connect():
+        raise HTTPException(status_code=error_status, detail=f"Failed to connect to {hostname}")
+
+
+def _call_cluster_operation(operation: Callable[[], object], *, hostname: str):
+    try:
+        return operation()
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
+    except ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 def _prune_console_sessions(now: Optional[float] = None) -> None:
@@ -295,12 +318,8 @@ def list_hosts():
 @router.get("/{hostname}/vms")
 def list_vms_for_host(hostname: str):
     cluster = get_cluster()
-    host = cluster.hosts.get(hostname)
-    if not host:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    if not host.conn:
-        if not host.connect():
-            raise HTTPException(status_code=500, detail=f"Failed to connect to {hostname}")
+    host = _get_required_host(cluster, hostname)
+    _ensure_host_connection(host, hostname)
     try:
         vms = host.list_vms()
         logger.info("Listed %d VMs for host %s", len(vms), hostname)
@@ -312,18 +331,14 @@ def list_vms_for_host(hostname: str):
 @router.post("/{hostname}/connect")
 def connect_host(hostname: str):
     cluster = get_cluster()
-    host = cluster.hosts.get(hostname)
-    if not host:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
+    host = _get_required_host(cluster, hostname)
     ok = host.connect()
     return {"host": hostname, "connected": bool(ok)}
 
 @router.post("/{hostname}/disconnect")
 def disconnect_host(hostname: str):
     cluster = get_cluster()
-    host = cluster.hosts.get(hostname)
-    if not host:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
+    host = _get_required_host(cluster, hostname)
     host.disconnect()
     return {"host": hostname, "disconnected": True}
 
@@ -332,16 +347,17 @@ def disconnect_host(hostname: str):
 def get_domain_details(hostname: str, name: str):
     cluster = get_cluster()
     try:
-        details = cluster.get_domain_details(hostname, name)
+        details = _call_cluster_operation(
+            lambda: cluster.get_domain_details(hostname, name),
+            hostname=hostname,
+        )
         return {
             "host": hostname,
             "domain": name,
             "details": details,
         }
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Failed to gather domain details for %s on %s: %s", name, hostname, exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -351,12 +367,13 @@ def get_domain_details(hostname: str, name: str):
 def get_host_details(hostname: str):
     cluster = get_cluster()
     try:
-        details = cluster.get_host_details(hostname)
+        details = _call_cluster_operation(
+            lambda: cluster.get_host_details(hostname),
+            hostname=hostname,
+        )
         return {"host": hostname, "details": details}
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Failed to gather host details for %s: %s", hostname, exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -366,7 +383,10 @@ def get_host_details(hostname: str):
 def control_domain(hostname: str, name: str, body: DomainActionRequest):
     cluster = get_cluster()
     try:
-        ok = cluster.control_domain(hostname, name, body.action)
+        ok = _call_cluster_operation(
+            lambda: cluster.control_domain(hostname, name, body.action),
+            hostname=hostname,
+        )
         if not ok:
             raise HTTPException(status_code=500, detail=f"Failed to execute {body.action} on {name}")
         return {
@@ -375,10 +395,8 @@ def control_domain(hostname: str, name: str, body: DomainActionRequest):
             "action": body.action,
             "status": "ok",
         }
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -390,11 +408,12 @@ def control_domain(hostname: str, name: str, body: DomainActionRequest):
 def generate_domain_console_file(hostname: str, name: str):
     cluster = get_cluster()
     try:
-        result = cluster.generate_guest_console_file(hostname, name)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        result = _call_cluster_operation(
+            lambda: cluster.generate_guest_console_file(hostname, name),
+            hostname=hostname,
+        )
+    except HTTPException:
+        raise
     except DomainNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except DomainNotRunningError as exc:
@@ -429,11 +448,12 @@ def generate_domain_console_file(hostname: str, name: str):
 async def create_console_session(hostname: str, name: str):
     cluster = get_cluster()
     try:
-        result = cluster.generate_guest_console_file(hostname, name)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        result = _call_cluster_operation(
+            lambda: cluster.generate_guest_console_file(hostname, name),
+            hostname=hostname,
+        )
+    except HTTPException:
+        raise
     except DomainNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except DomainNotRunningError as exc:
@@ -480,12 +500,13 @@ async def create_console_session(hostname: str, name: str):
 def get_storage_volume(hostname: str, pool: str, volume: str):
     cluster = get_cluster()
     try:
-        result = cluster.describe_storage_volume(hostname, pool, volume)
+        result = _call_cluster_operation(
+            lambda: cluster.describe_storage_volume(hostname, pool, volume),
+            hostname=hostname,
+        )
         return result
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except StoragePoolNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except StorageVolumeNotFoundError as exc:
@@ -501,12 +522,13 @@ def get_storage_volume(hostname: str, pool: str, volume: str):
 def delete_storage_volume(hostname: str, pool: str, volume: str, force: bool = False):
     cluster = get_cluster()
     try:
-        result = cluster.delete_storage_volume(hostname, pool, volume, force=force)
+        result = _call_cluster_operation(
+            lambda: cluster.delete_storage_volume(hostname, pool, volume, force=force),
+            hostname=hostname,
+        )
         return result
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except StoragePoolNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except StorageVolumeNotFoundError as exc:
@@ -576,20 +598,22 @@ async def upload_storage_volume(
 
     try:
         result = await run_in_threadpool(
-            cluster.upload_storage_volume,
-            hostname,
-            pool,
-            volume_name,
-            tmp_file.name,
-            size_bytes=total_bytes,
-            overwrite=overwrite,
-            volume_format=normalized_format,
+            lambda: _call_cluster_operation(
+                lambda: cluster.upload_storage_volume(
+                    hostname,
+                    pool,
+                    volume_name,
+                    tmp_file.name,
+                    size_bytes=total_bytes,
+                    overwrite=overwrite,
+                    volume_format=normalized_format,
+                ),
+                hostname=hostname,
+            )
         )
         return result
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except StoragePoolNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except StorageVolumeExistsError as exc:
@@ -626,24 +650,26 @@ async def create_guest_host(hostname: str, request: GuestCreateRequest):
 
     try:
         result = await run_in_threadpool(
-            cluster.create_guest,
-            hostname,
-            name=request.name,
-            vcpus=request.vcpus,
-            memory_mb=request.memory_mb,
-            autostart=request.autostart,
-            start=request.start,
-            description=request.description,
-            volumes=volume_payload,
-            networks=network_payload,
-            enable_vnc=request.enable_vnc,
-            vnc_password=request.vnc_password,
+            lambda: _call_cluster_operation(
+                lambda: cluster.create_guest(
+                    hostname,
+                    name=request.name,
+                    vcpus=request.vcpus,
+                    memory_mb=request.memory_mb,
+                    autostart=request.autostart,
+                    start=request.start,
+                    description=request.description,
+                    volumes=volume_payload,
+                    networks=network_payload,
+                    enable_vnc=request.enable_vnc,
+                    vnc_password=request.vnc_password,
+                ),
+                hostname=hostname,
+            )
         )
         return result
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except DomainExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except StoragePoolNotFoundError as exc:
@@ -668,16 +694,14 @@ async def detach_guest_block_device(hostname: str, name: str, target: str):
     cluster = get_cluster()
     try:
         result = await run_in_threadpool(
-            cluster.detach_guest_block_device,
-            hostname,
-            name,
-            target,
+            lambda: _call_cluster_operation(
+                lambda: cluster.detach_guest_block_device(hostname, name, target),
+                hostname=hostname,
+            )
         )
         return result
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except DomainNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except DomainDeviceNotFoundError as exc:
@@ -698,19 +722,21 @@ async def clone_guest_host(hostname: str, name: str, request: GuestCloneRequest)
     cluster = get_cluster()
     try:
         result = await run_in_threadpool(
-            cluster.clone_guest,
-            hostname,
-            name,
-            new_name=request.name,
-            autostart=request.autostart,
-            start=request.start,
-            description=request.description,
+            lambda: _call_cluster_operation(
+                lambda: cluster.clone_guest(
+                    hostname,
+                    name,
+                    new_name=request.name,
+                    autostart=request.autostart,
+                    start=request.start,
+                    description=request.description,
+                ),
+                hostname=hostname,
+            )
         )
         return GuestCloneResponse(**result)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except DomainNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except DomainExistsError as exc:
@@ -729,12 +755,15 @@ async def delete_guest_host(hostname: str, name: str, force: bool = False, remov
     cluster = get_cluster()
 
     try:
-        result = await run_in_threadpool(cluster.delete_guest, hostname, name, force=force, remove_storage=remove_storage)
+        result = await run_in_threadpool(
+            lambda: _call_cluster_operation(
+                lambda: cluster.delete_guest(hostname, name, force=force, remove_storage=remove_storage),
+                hostname=hostname,
+            )
+        )
         return result
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except DomainNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except DomainActiveError as exc:
@@ -975,12 +1004,13 @@ async def console_websocket(websocket: WebSocket, hostname: str, name: str, toke
 def delete_storage_pool(hostname: str, pool: str, force: bool = False):
     cluster = get_cluster()
     try:
-        result = cluster.delete_storage_pool(hostname, pool, force=force)
+        result = _call_cluster_operation(
+            lambda: cluster.delete_storage_pool(hostname, pool, force=force),
+            hostname=hostname,
+        )
         return result
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
-    except ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
     except StoragePoolNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except StoragePoolNotEmptyError as exc:
