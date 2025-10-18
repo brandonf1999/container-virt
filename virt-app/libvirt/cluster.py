@@ -11,6 +11,18 @@ class LibvirtCluster:
     def __init__(self):
         self.hosts: Dict[str, LibvirtHost] = {}
 
+    def _require_host(self, hostname: str) -> LibvirtHost:
+        host = self.hosts.get(hostname)
+        if not host:
+            raise KeyError(f"Host {hostname} not found")
+        return host
+
+    def _require_connected_host(self, hostname: str) -> LibvirtHost:
+        host = self._require_host(hostname)
+        if host.conn or host.connect():
+            return host
+        raise ConnectionError(f"Unable to connect to host {hostname}")
+
     # --------------------------------------------------------------
     # Host management
     # --------------------------------------------------------------
@@ -118,11 +130,7 @@ class LibvirtCluster:
         return cluster_info
 
     def get_host_details(self, hostname: str) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         details = host.get_host_info()
         details["guests"] = host.get_vm_inventory().get("vms", [])
         return details
@@ -156,19 +164,11 @@ class LibvirtCluster:
         return inventory, errors
 
     def delete_storage_volume(self, hostname: str, pool: str, volume: str, *, force: bool = False) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.delete_storage_volume(pool, volume, force=force)
 
     def delete_storage_pool(self, hostname: str, pool: str, *, force: bool = False) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.delete_storage_pool(pool, force=force)
 
     def upload_storage_volume(
@@ -182,11 +182,7 @@ class LibvirtCluster:
         overwrite: bool = False,
         volume_format: Optional[str] = None,
     ) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.upload_storage_volume(
             pool,
             volume,
@@ -211,11 +207,7 @@ class LibvirtCluster:
         enable_vnc: Optional[bool] = None,
         vnc_password: Optional[str] = None,
     ) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.create_guest(
             name,
             vcpus=vcpus,
@@ -239,11 +231,7 @@ class LibvirtCluster:
         start: bool = False,
         description: Optional[str] = None,
     ) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.clone_guest(
             source,
             new_name=new_name,
@@ -253,27 +241,15 @@ class LibvirtCluster:
         )
 
     def delete_guest(self, hostname: str, name: str, *, force: bool = False, remove_storage: bool = False) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.delete_guest(name, force=force, remove_storage=remove_storage)
 
     def detach_guest_block_device(self, hostname: str, name: str, target: str) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.detach_guest_block_device(name, target)
 
     def describe_storage_volume(self, hostname: str, pool: str, volume: str) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.describe_storage_volume(pool, volume)
 
     def get_vm_inventory(self):
@@ -291,27 +267,15 @@ class LibvirtCluster:
         return inventory, errors
 
     def generate_guest_console_file(self, hostname: str, domain: str) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.generate_vnc_connection_file(domain)
 
     def get_domain_details(self, hostname: str, domain: str) -> dict:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
         return host.get_domain_details(domain)
 
     def control_domain(self, hostname: str, domain: str, action: str) -> bool:
-        host = self.hosts.get(hostname)
-        if not host:
-            raise KeyError(f"Host {hostname} not found")
-        if not host.conn and not host.connect():
-            raise ConnectionError(f"Unable to connect to host {hostname}")
+        host = self._require_connected_host(hostname)
 
         action_map = {
             "start": host.start_domain,
