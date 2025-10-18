@@ -3,10 +3,8 @@ import asyncio.subprocess
 import contextlib
 import logging
 import os
-import secrets
 import socket
 import tempfile
-import time
 from pathlib import Path
 from typing import Callable, Dict, List, Literal, Optional, Tuple
 
@@ -15,6 +13,7 @@ from fastapi.responses import Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, model_validator
 
+from app.core.console_sessions import console_session_manager
 from app.deps import get_cluster
 from app.libvirt.host import (
     StorageError,
@@ -32,11 +31,6 @@ from app.libvirt.host import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/hosts", tags=["Hosts"])
-
-
-_CONSOLE_SESSION_TTL_SECONDS = 300
-_CONSOLE_SESSIONS: Dict[str, Dict[str, object]] = {}
-_CONSOLE_SESSIONS_LOCK = asyncio.Lock()
 
 
 def _get_required_host(cluster, hostname: str):
@@ -60,54 +54,6 @@ def _call_cluster_operation(operation: Callable[[], object], *, hostname: str):
         raise HTTPException(status_code=404, detail=f"Host {hostname} not found")
     except ConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
-
-
-def _prune_console_sessions(now: Optional[float] = None) -> None:
-    current = now or time.time()
-    expired_tokens = [token for token, payload in _CONSOLE_SESSIONS.items() if payload.get("expires_at", 0) <= current]
-    for token in expired_tokens:
-        _CONSOLE_SESSIONS.pop(token, None)
-
-
-async def _create_console_session_payload(
-    hostname: str,
-    domain: str,
-    *,
-    host: str,
-    port: int,
-    password: str,
-    ssh_target: Optional[str] = None,
-) -> Dict[str, object]:
-    now = time.time()
-    expires_at = now + _CONSOLE_SESSION_TTL_SECONDS
-    token = secrets.token_urlsafe(32)
-    payload: Dict[str, object] = {
-        "token": token,
-        "hostname": hostname,
-        "domain": domain,
-        "host": host,
-        "port": port,
-        "password": password,
-        "ssh_target": ssh_target,
-        "expires_at": expires_at,
-    }
-    async with _CONSOLE_SESSIONS_LOCK:
-        _prune_console_sessions(now)
-        _CONSOLE_SESSIONS[token] = payload
-    return payload
-
-
-async def _consume_console_session(token: str, hostname: str, domain: str) -> Optional[Dict[str, object]]:
-    async with _CONSOLE_SESSIONS_LOCK:
-        session = _CONSOLE_SESSIONS.pop(token, None)
-    if not session:
-        return None
-    expires_at = session.get("expires_at")
-    if isinstance(expires_at, (int, float)) and expires_at < time.time():
-        return None
-    if session.get("hostname") != hostname or session.get("domain") != domain:
-        return None
-    return session
 
 
 def _parse_ssh_target(target: str) -> Tuple[Optional[str], str, Optional[int]]:
@@ -477,7 +423,7 @@ async def create_console_session(hostname: str, name: str):
         raise HTTPException(status_code=500, detail="Invalid console port reported")
 
     ssh_target = result.get("ssh_target")
-    session_payload = await _create_console_session_payload(
+    session_payload = await console_session_manager.create(
         hostname,
         name,
         host=str(host),
@@ -777,7 +723,7 @@ async def delete_guest_host(hostname: str, name: str, force: bool = False, remov
 
 @router.websocket("/{hostname}/vms/{name}/console/{token}")
 async def console_websocket(websocket: WebSocket, hostname: str, name: str, token: str):
-    session = await _consume_console_session(token, hostname, name)
+    session = await console_session_manager.consume(token, hostname, name)
     if not session:
         await websocket.close(code=4401, reason="Invalid or expired console token")
         return
