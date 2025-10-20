@@ -1,6 +1,12 @@
 import logging
 from typing import Callable, Dict, Tuple
-from fastapi import APIRouter, HTTPException
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.db import async_session_dependency
+from app.db.services.domains import list_domains_by_host
+from app.db.services.network import list_networks
+from app.db.services.storage import list_storage_domains
 from app.deps import get_cluster
 
 logger = logging.getLogger(__name__)
@@ -88,18 +94,38 @@ def get_cluster_info():
     raise HTTPException(status_code=503, detail="Hosts connected but no information available")
 
 @router.get("/vms")
-def get_cluster_vms():
+async def get_cluster_vms(db_session=Depends(async_session_dependency())):
     cluster = get_cluster()
-    return _build_inventory_response(cluster, cluster.get_vm_inventory, include_vm_counts=True)
+    response = _build_inventory_response(cluster, cluster.get_vm_inventory, include_vm_counts=False)
+
+    inventory, vm_counts = await list_domains_by_host(db_session)
+    response["hosts"] = inventory
+
+    summary = dict(response.get("summary") or {})
+    summary["reported_hosts"] = len(inventory)
+    summary["vm_counts"] = {
+        "online": vm_counts.get("online", 0),
+        "stopped": vm_counts.get("stopped", 0),
+        "failed": vm_counts.get("failed", 0),
+        "total": vm_counts.get("total", 0),
+    }
+    response["summary"] = summary
+    return response
 
 
 @router.get("/networks")
-def get_cluster_networks():
+async def get_cluster_networks(db_session=Depends(async_session_dependency())):
     cluster = get_cluster()
-    return _build_inventory_response(cluster, cluster.get_network_inventory)
+    response = _build_inventory_response(cluster, cluster.get_network_inventory)
+    networks = await list_networks(db_session)
+    response["networks"] = networks
+    return response
 
 
 @router.get("/storage")
-def get_cluster_storage():
+async def get_cluster_storage(db_session=Depends(async_session_dependency())):
     cluster = get_cluster()
-    return _build_inventory_response(cluster, cluster.get_storage_inventory)
+    response = _build_inventory_response(cluster, cluster.get_storage_inventory)
+    storage = await list_storage_domains(db_session)
+    response["storage_domains"] = storage
+    return response

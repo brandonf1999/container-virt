@@ -6,6 +6,8 @@ cors:
     - "http://127.0.0.1:5173"
     - "http://localhost:8080"
     - "http://127.0.0.1:8080"
+    - "http://localhost:8000"
+    - "http://127.0.0.1:8000"
     - "http://virtlab.foos.net"
   allow_credentials: true
   allow_methods: ["*"]
@@ -13,6 +15,10 @@ cors:
 
 hosts:
   - hostname: virt0001.foos.net
+    user: admin
+    ssh:
+      known_hosts_verify: ignore
+  - hostname: virt0002.foos.net
     user: admin
     ssh:
       known_hosts_verify: ignore

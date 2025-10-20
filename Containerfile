@@ -69,6 +69,8 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY virt-app ./app
 COPY config.yaml ./config.yaml
+COPY alembic.ini ./alembic.ini
+COPY bin ./bin
 
 ENV PYTHONUNBUFFERED=1 \
     CONFIG_FILE=/opt/virt-app/config.yaml \
@@ -76,6 +78,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
+ENTRYPOINT ["/opt/virt-app/bin/prestart.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 ###########################
@@ -109,10 +112,13 @@ RUN useradd -m -u 1000 virt
 WORKDIR /opt/virt-app
 COPY virt-app ./app
 COPY config.yaml ./config.yaml
+COPY alembic.ini ./alembic.ini
+COPY bin ./bin
 
 RUN chown -R virt:virt /opt/virt-app
 
 USER virt
 EXPOSE 8000
 
+ENTRYPOINT ["/opt/virt-app/bin/prestart.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

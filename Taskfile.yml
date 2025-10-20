@@ -14,6 +14,14 @@ vars:
   HOST_PORT:          "{{.HOST_PORT | default `8000`}}"
   DEV_PORT:           "{{.DEV_PORT | default `8000`}}"
 
+  DB_CONTAINER:       "{{.DB_CONTAINER | default `virtlab-postgres`}}"
+  DB_IMAGE:           "{{.DB_IMAGE | default `docker.io/library/postgres:16`}}"
+  DB_PORT:            "{{.DB_PORT | default `5432`}}"
+  DB_USER:            "{{.DB_USER | default `virtlab`}}"
+  DB_PASSWORD:        "{{.DB_PASSWORD | default `virtlab`}}"
+  DB_NAME:            "{{.DB_NAME | default `virtlab`}}"
+  DB_DATA_DIR:        "{{.DB_DATA_DIR | default `.data/postgres`}}"
+
   CONTEXT:            "{{.CONTEXT | default `.`}}"
   CONTAINERFILE:      "{{.CONTAINERFILE | default `Containerfile`}}"
 
@@ -28,6 +36,34 @@ includes:
 silent: false
 
 tasks:
+  env:create:
+    desc: Create the local Python virtual environment under .venv
+    cmds:
+      - |
+        set -euo pipefail
+        if [ ! -d .venv ]; then
+          python3 -m venv .venv
+        else
+          echo ".venv already exists"
+        fi
+
+  env:install:
+    desc: Install Python dependencies into the virtual environment
+    deps: [env:create]
+    cmds:
+      - |
+        set -euo pipefail
+        if [ ! -x .venv/bin/python ]; then
+          echo "Virtualenv missing; run 'task env:create' first" >&2
+          exit 1
+        fi
+        .venv/bin/python -m pip install --upgrade pip
+        .venv/bin/pip install -r requirements.txt
+
+  env:bootstrap:
+    desc: Create the virtualenv and install backend dependencies
+    deps: [env:install]
+
   build:
     desc: Build production image with buildah bud
     cmds:
@@ -103,6 +139,7 @@ tasks:
           -p {{.DEV_PORT}}:8000 \
           -v {{.APP_SRC}}:/opt/virt-app/app:Z \
           -v {{.SSH_DIR}}:/home/virt/.ssh:Z,U \
+          -e DATABASE_URL=postgresql+asyncpg://{{.DB_USER}}:{{.DB_PASSWORD}}@host.containers.internal:{{.DB_PORT}}/{{.DB_NAME}} \
           {{.DEV_IMAGE}}
         echo "Dev API listening on http://localhost:{{.DEV_PORT}}"
 
@@ -145,3 +182,125 @@ tasks:
       - task: clean
       - buildah rm --all >/dev/null 2>&1 || true
       - buildah rmi --all >/dev/null 2>&1 || true
+
+  db:upgrade:
+    desc: Apply Alembic migrations to the target database
+    cmds:
+      - |
+        set -euo pipefail
+        if [ -z "${DATABASE_URL:-}" ]; then
+          export DATABASE_URL="postgresql+asyncpg://{{.DB_USER}}:{{.DB_PASSWORD}}@localhost:{{.DB_PORT}}/{{.DB_NAME}}"
+        fi
+        PYTHONPATH_OLD="${PYTHONPATH:-}"
+        export PYTHONPATH="virt-app${PYTHONPATH_OLD:+:${PYTHONPATH_OLD}}"
+        if [ ! -x .venv/bin/python ]; then
+          echo "Missing .venv; run 'task env:bootstrap' first" >&2
+          exit 1
+        fi
+        .venv/bin/python -m alembic -c alembic.ini upgrade {{.TARGET | default "head"}}
+        echo "Alembic upgrade completed"
+
+  db:downgrade:
+    desc: Revert Alembic migrations to a previous revision
+    cmds:
+      - |
+        set -euo pipefail
+        if [ -z "${DATABASE_URL:-}" ]; then
+          export DATABASE_URL="postgresql+asyncpg://{{.DB_USER}}:{{.DB_PASSWORD}}@localhost:{{.DB_PORT}}/{{.DB_NAME}}"
+        fi
+        PYTHONPATH_OLD="${PYTHONPATH:-}"
+        export PYTHONPATH="virt-app${PYTHONPATH_OLD:+:${PYTHONPATH_OLD}}"
+        if [ ! -x .venv/bin/python ]; then
+          echo "Missing .venv; run 'task env:bootstrap' first" >&2
+          exit 1
+        fi
+        .venv/bin/python -m alembic -c alembic.ini downgrade {{.TARGET | default "-1"}}
+        echo "Alembic downgrade completed"
+
+  db:revision:
+    desc: Create a new Alembic revision using autogenerate metadata
+    vars:
+      MESSAGE: '{{.MESSAGE | default "auto revision"}}'
+    cmds:
+      - |
+        set -euo pipefail
+        if [ -z "${DATABASE_URL:-}" ]; then
+          export DATABASE_URL="postgresql+asyncpg://{{.DB_USER}}:{{.DB_PASSWORD}}@localhost:{{.DB_PORT}}/{{.DB_NAME}}"
+        fi
+        PYTHONPATH_OLD="${PYTHONPATH:-}"
+        export PYTHONPATH="virt-app${PYTHONPATH_OLD:+:${PYTHONPATH_OLD}}"
+        if [ ! -x .venv/bin/python ]; then
+          echo "Missing .venv; run 'task env:bootstrap' first" >&2
+          exit 1
+        fi
+        .venv/bin/python -m alembic -c alembic.ini revision --autogenerate -m "{{.MESSAGE}}"
+        echo "Alembic revision created"
+
+  db:check:
+    desc: Validate database connectivity with a lightweight async query
+    cmds:
+      - |
+        set -euo pipefail
+        if [ -z "${DATABASE_URL:-}" ]; then
+          export DATABASE_URL="postgresql+asyncpg://{{.DB_USER}}:{{.DB_PASSWORD}}@localhost:{{.DB_PORT}}/{{.DB_NAME}}"
+        fi
+        PYTHONPATH_OLD="${PYTHONPATH:-}"
+        export PYTHONPATH="virt-app${PYTHONPATH_OLD:+:${PYTHONPATH_OLD}}"
+        if [ ! -x .venv/bin/python ]; then
+          echo "Missing .venv; run 'task env:bootstrap' first" >&2
+          exit 1
+        fi
+        .venv/bin/python - <<'PY'
+        import asyncio
+        from sqlalchemy import text
+        from db.engine import get_async_engine
+
+
+        async def main() -> None:
+            engine = get_async_engine()
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            await engine.dispose()
+            print("Database connection OK")
+
+
+        if __name__ == "__main__":
+            asyncio.run(main())
+        PY
+
+  db:dev:up:
+    desc: Start a local PostgreSQL container for development
+    cmds:
+      - |
+        set -euo pipefail
+        mkdir -p {{.DB_DATA_DIR}}
+        podman rm -f {{.DB_CONTAINER}} >/dev/null 2>&1 || true
+        podman run -d --name {{.DB_CONTAINER}} \
+          -e POSTGRES_USER={{.DB_USER}} \
+          -e POSTGRES_PASSWORD={{.DB_PASSWORD}} \
+          -e POSTGRES_DB={{.DB_NAME}} \
+          -p {{.DB_PORT}}:5432 \
+          -v {{.DB_DATA_DIR}}:/var/lib/postgresql/data:Z \
+          {{.DB_IMAGE}}
+        echo "PostgreSQL is running on localhost:{{.DB_PORT}}"
+        echo "Use DATABASE_URL=postgresql+asyncpg://{{.DB_USER}}:{{.DB_PASSWORD}}@localhost:{{.DB_PORT}}/{{.DB_NAME}}"
+
+  db:dev:down:
+    desc: Stop and remove the local PostgreSQL container
+    cmds:
+      - |
+        set -euo pipefail
+        podman rm -f {{.DB_CONTAINER}} >/dev/null 2>&1 || true
+
+  db:dev:logs:
+    desc: Tail logs from the local PostgreSQL container
+    cmds:
+      - podman logs -f {{.DB_CONTAINER}}
+
+  db:dev:psql:
+    desc: Open a psql shell inside the local PostgreSQL container
+    interactive: true
+    cmds:
+      - |
+        set -euo pipefail
+        podman exec -it {{.DB_CONTAINER}} psql -U {{.DB_USER}} {{.DB_NAME}}

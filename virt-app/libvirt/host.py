@@ -6,6 +6,11 @@ from urllib.parse import urlencode
 
 import libvirt
 
+from app.db.ingestion import (
+    ingest_domain_inventory,
+    ingest_network_inventory,
+    ingest_storage_inventory,
+)
 from .networking import gather_host_network_inventory
 from .domain import LibvirtDomainManager
 from .host_metrics import LibvirtHostMetrics
@@ -16,6 +21,20 @@ logger = logging.getLogger(__name__)
 # Register default event loop once (prevents keepalive error)
 try:
     libvirt.virEventRegisterDefaultImpl()
+except Exception:
+    pass
+
+
+def _log_libvirt_error(context, error):
+    try:
+        message = str(error)
+    except Exception:
+        message = repr(error)
+    logger.debug("Suppressed libvirt error: %s", message)
+
+
+try:
+    libvirt.registerErrorHandler(_log_libvirt_error, None)
 except Exception:
     pass
 
@@ -147,10 +166,46 @@ class LibvirtHost:
     def get_network_inventory(self) -> Dict:
         if not self._ensure_connection():
             raise RuntimeError(f"Not connected to {self.hostname}")
-        return gather_host_network_inventory(self.conn)
+        inventory = gather_host_network_inventory(self.conn)
+        try:
+            ingest_network_inventory(
+                hostname=self.hostname,
+                uri=self.uri,
+                user=self.user,
+                ssh_options=self.ssh_opts,
+                inventory=inventory,
+            )
+        except Exception as exc:
+            logger.exception("Failed to persist network inventory for %s: %s", self.hostname, exc)
+        return inventory
 
     def get_storage_inventory(self) -> Dict:
-        return self.storage.get_inventory()
+        inventory = self.storage.get_inventory()
+        try:
+            ingest_storage_inventory(
+                hostname=self.hostname,
+                uri=self.uri,
+                user=self.user,
+                ssh_options=self.ssh_opts,
+                inventory=inventory,
+            )
+        except Exception as exc:
+            logger.exception("Failed to persist storage inventory for %s: %s", self.hostname, exc)
+        return inventory
+
+    def get_vm_inventory(self) -> Dict:
+        inventory = self.domains.get_vm_inventory()
+        try:
+            ingest_domain_inventory(
+                hostname=self.hostname,
+                uri=self.uri,
+                user=self.user,
+                ssh_options=self.ssh_opts,
+                inventory=inventory,
+            )
+        except Exception as exc:
+            logger.exception("Failed to persist domain inventory for %s: %s", self.hostname, exc)
+        return inventory
 
     def describe_storage_volume(self, pool_name: str, volume_name: str) -> Dict[str, Any]:
         return self.storage.describe_volume(pool_name, volume_name)
@@ -257,6 +312,3 @@ class LibvirtHost:
 
     def get_domain_details(self, name: str) -> Dict[str, Any]:
         return self.domains.get_domain_details(name)
-
-    def get_vm_inventory(self) -> Dict:
-        return self.domains.get_vm_inventory()

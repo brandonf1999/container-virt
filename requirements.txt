@@ -3,3 +3,7 @@ uvicorn[standard]
 PyYAML
 libvirt-python
 python-multipart
+SQLAlchemy>=2.0
+alembic>=1.12
+asyncpg
+psycopg[binary]

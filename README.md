@@ -54,13 +54,43 @@ Environment variables override key settings:
 
 ## Local Development
 ```bash
-python -m venv .venv
+python -m venv .venv              # or: task env:bootstrap
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt   # task env:bootstrap runs this automatically
 export CONFIG_FILE=$(pwd)/config.yaml
 uvicorn virt-app.app.main:app --reload --host 0.0.0.0 --port 8000
 ```
-Run these commands from the repository root so `uvicorn` can import the `virt-app` package. Visit `http://localhost:8000/docs` for interactive OpenAPI docs. The frontend defaults to `http://localhost:8000` when using the dev container.
+Run these commands from the repository root so `uvicorn` can import the `virt-app` package. If you prefer the Taskfile helper, execute `task env:bootstrap` once to create `.venv` and install dependencies before launching the app. Visit `http://localhost:8000/docs` for interactive OpenAPI docs. The frontend defaults to `http://localhost:8000` when using the dev container.
+
+### Database Migrations
+Set `DATABASE_URL` (defaults to `postgresql+asyncpg://postgres:postgres@localhost:5432/virtlab`) before invoking the migration helpers below. New revisions reflect the ORM models under `virt-app/db/models`.
+
+- `task db:check` – run a quick async connectivity check using the configured database URL
+- `task db:upgrade` – apply migrations up to the requested target (defaults to `head`)
+- `task db:downgrade` – roll back the schema by one revision or to a provided target
+- `task db:revision MESSAGE="add widgets"` – autogenerate a revision after updating ORM models
+
+#### Dev PostgreSQL
+Spin up a local database with Podman and have it persist data under `.data/postgres`:
+
+- `task db:dev:up` – launch PostgreSQL (default image `postgres:16` on port `5433`)
+- `task db:dev:down` – stop and remove the container
+- `task db:dev:logs` – stream server logs
+- `task db:dev:psql` – open a psql shell inside the container
+
+By default the instance exposes `DATABASE_URL=postgresql+asyncpg://virtlab:virtlab@localhost:5433/virtlab`. The Taskfile falls back to this URL for `task db:check` if `DATABASE_URL` is unset. Adjust credentials or ports via Task variables (e.g., `task db:dev:up DB_PORT=5544`).
+
+### Storage & Network Schema
+- `storage_domains` capture libvirt pools (shared or host-local) with extra driver metadata. Shared pools deduplicate on name/type; local pools fan out via host status records.
+- `host_storage_status` tracks each host's availability for a given domain, including capacity metrics and health state.
+- `networks` normalize libvirt network definitions (bridge, VLAN, forward mode) with optional shared flags.
+- `host_network_status` records per-host network state (active/inactive/missing) and operational details such as bridge activity.
+
+Run `go-task db:revision MESSAGE="storage topology"` after you adjust the ORM models, then `go-task db:upgrade` to apply the schema changes.
+
+### Storage APIs
+- `GET /api/cluster/storage` – legacy per-host inventory plus a `storage_domains` array sourced from the database (each entry includes host summaries).
+- `GET /api/storage/{uuid}` – detailed view for a single storage domain showing host mount status and capacity metrics.
 
 ### Tests & Linting
 Run the project's test suite (once available) with `pytest`. Ensure any new libvirt interactions are covered by unit or integration tests before pushing changes.

@@ -43,6 +43,7 @@ instance/
 .env.*
 !.env.example
 .ssh/
+.data/
 
 # Misc
 .DS_Store

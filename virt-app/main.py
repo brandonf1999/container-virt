@@ -13,7 +13,8 @@ from .core.config import (
     CORS_ALLOW_HEADERS,
 )
 from .core.logging import setup_logging
-from .api import health, hosts, cluster as cluster_api, system_logs
+from .api import health, hosts, cluster as cluster_api, storage, system_logs, network
+from .db.lifecycle import on_startup as db_on_startup, on_shutdown as db_on_shutdown
 
 # Initialize Logging
 setup_logging()
@@ -59,15 +60,19 @@ async def log_requests(request: Request, call_next):
 app.include_router(health.router, prefix='/api')
 app.include_router(hosts.router, prefix='/api')
 app.include_router(cluster_api.router, prefix='/api')
+app.include_router(storage.router, prefix='/api')
+app.include_router(network.router, prefix='/api')
 app.include_router(system_logs.router, prefix='/api')
 
 # Optional: lifecycle events
 @app.on_event("startup")
 async def on_startup():
+    await db_on_startup()
     logger.info("Starting %s v%s", APP_NAME, APP_VERSION)
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    await db_on_shutdown()
     logger.info("Shutting down %s", APP_NAME)
 
 @app.get("/", tags=["Root"])

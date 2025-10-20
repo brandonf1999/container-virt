@@ -279,11 +279,17 @@ class LibvirtDomainInventory:
         mem_kib = int(info[2]) if len(info) > 2 else None
         vcpus = int(info[3]) if len(info) > 3 else None
         cpu_time_ns = int(info[4]) if len(info) > 4 else None
+        try:
+            uuid = domain.UUIDString()
+        except libvirt.libvirtError:
+            uuid = None
         entry: Dict[str, Any] = {
             "name": name,
             "state": _map_domain_state(state_code),
             "state_code": state_code,
         }
+        if isinstance(uuid, str) and uuid:
+            entry["uuid"] = uuid
         try:
             entry["persistent"] = bool(domain.isPersistent())
         except libvirt.libvirtError:
