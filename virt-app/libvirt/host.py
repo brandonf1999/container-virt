@@ -58,10 +58,17 @@ def _should_retry_libvirt_error(exc: "libvirt.libvirtError") -> bool:
 class LibvirtHost:
     """Manages a single libvirt host connection over SSH."""
 
-    def __init__(self, hostname: str, user: Optional[str] = None, ssh_opts: Optional[Dict] = None):
+    def __init__(
+        self,
+        hostname: str,
+        user: Optional[str] = None,
+        ssh_opts: Optional[Dict] = None,
+        migration_opts: Optional[Dict] = None,
+    ):
         self.hostname = hostname
         self.user = user
         self.ssh_opts = ssh_opts or {}
+        self.migration_opts = migration_opts or {}
         self.conn: Optional[libvirt.virConnect] = None
         self.storage = LibvirtStorageManager(self, _should_retry_libvirt_error)
         self.domains = LibvirtDomainManager(self, _should_retry_libvirt_error)
@@ -83,6 +90,30 @@ class LibvirtHost:
         if kh_path:
             query["known_hosts"] = kh_path
         return f"{base}?{urlencode(query)}" if query else base
+
+    def migration_transport(self) -> str:
+        transport = (self.migration_opts.get("transport") or "tcp").strip().lower()
+        return transport or "tcp"
+
+    def migration_uri(self) -> str:
+        transport = self.migration_transport()
+        user_prefix = f"{self.user}@" if transport == "ssh" and self.user else ""
+        host = f"{user_prefix}{self.hostname}"
+        port = self.migration_opts.get("port")
+        base = f"qemu+{transport}://{host}"
+        if port:
+            base = f"{base}:{port}"
+
+        query = {}
+        if transport == "ssh":
+            khv = self.ssh_opts.get("known_hosts_verify")
+            if khv in {"normal", "auto", "ignore"}:
+                query["known_hosts_verify"] = khv
+            kh_path = self.ssh_opts.get("known_hosts")
+            if kh_path:
+                query["known_hosts"] = kh_path
+
+        return f"{base}/system" + (f"?{urlencode(query)}" if query else "")
 
     def connect(self) -> bool:
         try:
@@ -250,6 +281,7 @@ class LibvirtHost:
         *,
         vcpus: int,
         memory_mb: int,
+        cpu_mode: str = "host-model",
         autostart: bool,
         start: bool,
         description: Optional[str],
@@ -262,6 +294,7 @@ class LibvirtHost:
             name,
             vcpus=vcpus,
             memory_mb=memory_mb,
+            cpu_mode=cpu_mode,
             autostart=autostart,
             start=start,
             description=description,
@@ -269,6 +302,19 @@ class LibvirtHost:
             networks=networks,
             enable_vnc=enable_vnc,
             vnc_password=vnc_password,
+        )
+
+    def define_guest_from_xml(
+        self,
+        xml: str,
+        *,
+        start: bool = False,
+        autostart: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        return self.domains.define_guest_from_xml(
+            xml,
+            start=start,
+            autostart=autostart,
         )
 
     def clone_guest(
@@ -297,6 +343,27 @@ class LibvirtHost:
     ) -> Dict[str, Any]:
         return self.domains.delete_guest(name, force=force, remove_storage=remove_storage)
 
+    def migrate_guest(
+        self,
+        name: str,
+        target_host: "LibvirtHost",
+        *,
+        live: bool = True,
+        shared_storage: bool = True,
+        autostart: Optional[bool] = None,
+        tunnelled: Optional[bool] = None,
+        peer2peer: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        return self.domains.migrate_guest(
+            name,
+            target_host,
+            live=live,
+            shared_storage=shared_storage,
+            autostart=autostart,
+            tunnelled=tunnelled,
+            peer2peer=peer2peer,
+        )
+
     def detach_guest_block_device(
         self,
         name: str,
@@ -312,3 +379,18 @@ class LibvirtHost:
 
     def get_domain_details(self, name: str) -> Dict[str, Any]:
         return self.domains.get_domain_details(name)
+
+    def get_domain_xml(self, name: str) -> str:
+        if not self._ensure_connection():  # pylint: disable=protected-access
+            raise RuntimeError(f"Not connected to {self.hostname}")
+        try:
+            domain = self.conn.lookupByName(name)  # type: ignore[union-attr]
+        except libvirt.libvirtError as exc:
+            logger.error("lookupByName(%s) failed on %s when fetching XML: %s", name, self.hostname, exc)
+            raise
+        flags = getattr(libvirt, "VIR_DOMAIN_XML_SECURE", 0) | getattr(libvirt, "VIR_DOMAIN_XML_INACTIVE", 0)
+        try:
+            return domain.XMLDesc(flags)
+        except libvirt.libvirtError as exc:
+            logger.error("XMLDesc failed for %s on %s: %s", name, self.hostname, exc)
+            raise

@@ -38,6 +38,8 @@ def _extract_metrics(payload: Any) -> Dict[str, Any]:
         "vcpu_count",
         "memory_mb",
         "max_memory_mb",
+        "total_memory_mb",
+        "used_memory_mb",
         "cpu_time_seconds",
         "uptime_seconds",
     ):
@@ -120,4 +122,3 @@ async def list_domains_by_host(session: AsyncSession) -> Tuple[Dict[str, Dict[st
         "total": counts.get("total", 0),
     }
     return inventory, summary
-

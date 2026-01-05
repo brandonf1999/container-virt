@@ -52,6 +52,27 @@ class LibvirtDomainManager:
     def detach_guest_block_device(self, name: str, target: str) -> Dict[str, Any]:
         return self.lifecycle.detach_guest_block_device(name, target)
 
+    def migrate_guest(
+        self,
+        name: str,
+        target_host,
+        *,
+        live: bool = True,
+        shared_storage: bool = True,
+        autostart: Optional[bool] = None,
+        tunnelled: Optional[bool] = None,
+        peer2peer: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        return self.lifecycle.migrate_guest(
+            name,
+            target_host,
+            live=live,
+            shared_storage=shared_storage,
+            autostart=autostart,
+            tunnelled=tunnelled,
+            peer2peer=peer2peer,
+        )
+
     def start_domain(self, name: str) -> bool:
         return self.lifecycle.start_domain(name)
 
@@ -70,6 +91,7 @@ class LibvirtDomainManager:
         *,
         vcpus: int,
         memory_mb: int,
+        cpu_mode: str = "host-model",
         autostart: bool,
         start: bool,
         description: Optional[str],
@@ -82,6 +104,7 @@ class LibvirtDomainManager:
             name,
             vcpus=vcpus,
             memory_mb=memory_mb,
+            cpu_mode=cpu_mode,
             autostart=autostart,
             start=start,
             description=description,
@@ -89,6 +112,19 @@ class LibvirtDomainManager:
             networks=networks,
             enable_vnc=enable_vnc,
             vnc_password=vnc_password,
+        )
+
+    def define_guest_from_xml(
+        self,
+        xml: str,
+        *,
+        start: bool = False,
+        autostart: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        return self.lifecycle.define_guest_from_xml(
+            xml,
+            start=start,
+            autostart=autostart,
         )
 
     # ------------------------------------------------------------------
