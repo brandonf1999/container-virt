@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Sequence
 from uuid import UUID
 
 from sqlalchemy import delete, select
@@ -47,6 +47,8 @@ def _normalise_metrics(payload: Any) -> Dict[str, Any]:
         "vcpu_count",
         "memory_mb",
         "max_memory_mb",
+        "total_memory_mb",
+        "used_memory_mb",
         "cpu_time_seconds",
         "uptime_seconds",
     ):
@@ -71,6 +73,27 @@ def _normalise_ips(values: Any) -> list[str]:
         if text:
             ips.append(text)
     return ips
+
+
+def _apply_payload_to_domain(domain: Domain, payload: Dict[str, Any], now: datetime) -> None:
+    domain.state = _coerce_state(payload.get("state"))
+    state_code = payload.get("state_code")
+    domain.state_code = int(state_code) if isinstance(state_code, int) else None
+    persistent = payload.get("persistent")
+    if isinstance(persistent, bool):
+        domain.persistent = persistent
+    else:
+        domain.persistent = None
+
+    metrics = _normalise_metrics(payload.get("metrics"))
+    domain.metrics = metrics
+    domain.vcpu_count = (
+        int(metrics["vcpu_count"]) if "vcpu_count" in metrics and metrics["vcpu_count"] is not None else None
+    )
+    memory_mb = metrics.get("memory_mb")
+    domain.memory_mb = int(memory_mb) if isinstance(memory_mb, (int, float)) else None
+    domain.guest_agent_ips = _normalise_ips(payload.get("guest_agent_ips"))
+    domain.last_seen = now
 
 
 async def sync_domain_inventory(
@@ -117,24 +140,7 @@ async def sync_domain_inventory(
             domain.name = str(name)
         by_name[str(name)] = domain
 
-        domain.state = _coerce_state(payload.get("state"))
-        state_code = payload.get("state_code")
-        domain.state_code = int(state_code) if isinstance(state_code, int) else None
-        persistent = payload.get("persistent")
-        if isinstance(persistent, bool):
-            domain.persistent = persistent
-        else:
-            domain.persistent = None
-
-        metrics = _normalise_metrics(payload.get("metrics"))
-        domain.metrics = metrics
-        domain.vcpu_count = (
-            int(metrics["vcpu_count"]) if "vcpu_count" in metrics and metrics["vcpu_count"] is not None else None
-        )
-        memory_mb = metrics.get("memory_mb")
-        domain.memory_mb = int(memory_mb) if isinstance(memory_mb, (int, float)) else None
-        domain.guest_agent_ips = _normalise_ips(payload.get("guest_agent_ips"))
-        domain.last_seen = now
+        _apply_payload_to_domain(domain, payload, now)
 
         seen_ids.add(domain.id)
 
@@ -159,3 +165,51 @@ async def sync_domain_inventory(
     facts["domain_errors"] = sanitised_errors
     host.facts = facts
     host.last_seen = now
+
+
+async def list_domain_uuids_for_host(
+    session: AsyncSession,
+    *,
+    host: Host,
+) -> set[str]:
+    """Return the UUIDs of domains tracked for the given host."""
+
+    stmt = select(Domain.uuid).where(Domain.host_id == host.id)
+    uuids: Sequence[UUID] = (await session.scalars(stmt)).all()
+    return {str(value) for value in uuids if value}
+
+
+async def adopt_domain_from_inventory(
+    session: AsyncSession,
+    *,
+    host: Host,
+    payload: Dict[str, Any],
+) -> Domain:
+    """Create or update a domain record using a libvirt inventory payload."""
+
+    uuid_value = _coerce_uuid(payload.get("uuid"))
+    if uuid_value is None:
+        raise ValueError("VM payload missing a valid UUID")
+    name = payload.get("name") or str(uuid_value)
+
+    stmt = select(Domain).where(Domain.host_id == host.id, Domain.uuid == uuid_value)
+    domain = await session.scalar(stmt)
+    now = datetime.now(timezone.utc)
+
+    if domain is None:
+        domain = Domain(host_id=host.id, uuid=uuid_value, name=str(name))
+        session.add(domain)
+    else:
+        domain.name = str(name)
+
+    _apply_payload_to_domain(domain, payload, now)
+    host.last_seen = now
+    await session.flush()
+    return domain
+
+
+__all__ = [
+    "sync_domain_inventory",
+    "list_domain_uuids_for_host",
+    "adopt_domain_from_inventory",
+]

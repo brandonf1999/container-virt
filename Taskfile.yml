@@ -129,7 +129,7 @@ tasks:
 
   dev:up:
     desc: Run development container with live code mount
-    deps: [dev:build]
+    deps: [dev:build,db:dev:up]
     cmds:
       - |
         set -euo pipefail

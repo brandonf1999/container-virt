@@ -26,16 +26,28 @@ class LibvirtCluster:
     # --------------------------------------------------------------
     # Host management
     # --------------------------------------------------------------
-    def add_host(self, hostname: str, user: Optional[str] = None, ssh_opts: Optional[dict] = None):
+    def add_host(
+        self,
+        hostname: str,
+        user: Optional[str] = None,
+        ssh_opts: Optional[dict] = None,
+        migration_opts: Optional[dict] = None,
+    ):
         """
         Add a host to the cluster.
         :param hostname: Hostname or IP address
         :param user: SSH user for the connection
         :param ssh_opts: SSH configuration options (e.g., {'known_hosts_verify': 'ignore'})
+        :param migration_opts: Migration transport settings (e.g., {'transport': 'tcp', 'port': 16509})
         """
         if hostname not in self.hosts:
-            self.hosts[hostname] = LibvirtHost(hostname, user, ssh_opts)
-            logger.info("Added host %s (ssh_opts=%s)", hostname, ssh_opts)
+            self.hosts[hostname] = LibvirtHost(hostname, user, ssh_opts, migration_opts)
+            logger.info(
+                "Added host %s (ssh_opts=%s, migration=%s)",
+                hostname,
+                ssh_opts,
+                migration_opts,
+            )
         else:
             logger.warning("Host %s already added, skipping.", hostname)
 
@@ -67,10 +79,11 @@ class LibvirtCluster:
             hostname = entry.get("hostname")
             user = entry.get("user")
             ssh_opts = entry.get("ssh", {}) or {}
+            migration_opts = entry.get("migration", {}) or {}
             if not hostname:
                 logger.warning("Invalid host entry (missing hostname): %s", entry)
                 continue
-            self.add_host(hostname, user, ssh_opts)
+            self.add_host(hostname, user, ssh_opts, migration_opts)
 
     # --------------------------------------------------------------
     # Connection management
@@ -199,6 +212,7 @@ class LibvirtCluster:
         name: str,
         vcpus: int,
         memory_mb: int,
+        cpu_mode: str = "host-model",
         autostart: bool,
         start: bool,
         description: Optional[str],
@@ -212,6 +226,7 @@ class LibvirtCluster:
             name,
             vcpus=vcpus,
             memory_mb=memory_mb,
+            cpu_mode=cpu_mode,
             autostart=autostart,
             start=start,
             description=description,
@@ -220,6 +235,17 @@ class LibvirtCluster:
             enable_vnc=enable_vnc,
             vnc_password=vnc_password,
         )
+
+    def define_guest_from_xml(
+        self,
+        hostname: str,
+        xml: str,
+        *,
+        start: bool = False,
+        autostart: Optional[bool] = None,
+    ) -> dict:
+        host = self._require_connected_host(hostname)
+        return host.define_guest_from_xml(xml, start=start, autostart=autostart)
 
     def clone_guest(
         self,
@@ -243,6 +269,30 @@ class LibvirtCluster:
     def delete_guest(self, hostname: str, name: str, *, force: bool = False, remove_storage: bool = False) -> dict:
         host = self._require_connected_host(hostname)
         return host.delete_guest(name, force=force, remove_storage=remove_storage)
+
+    def migrate_guest(
+        self,
+        hostname: str,
+        name: str,
+        target_host: str,
+        *,
+        live: bool = True,
+        shared_storage: bool = True,
+        autostart: Optional[bool] = None,
+        tunnelled: Optional[bool] = None,
+        peer2peer: Optional[bool] = None,
+    ) -> dict:
+        source = self._require_connected_host(hostname)
+        target = self._require_connected_host(target_host)
+        return source.migrate_guest(
+            name,
+            target,
+            live=live,
+            shared_storage=shared_storage,
+            autostart=autostart,
+            tunnelled=tunnelled,
+            peer2peer=peer2peer,
+        )
 
     def detach_guest_block_device(self, hostname: str, name: str, target: str) -> dict:
         host = self._require_connected_host(hostname)
@@ -273,6 +323,10 @@ class LibvirtCluster:
     def get_domain_details(self, hostname: str, domain: str) -> dict:
         host = self._require_connected_host(hostname)
         return host.get_domain_details(domain)
+
+    def get_domain_xml(self, hostname: str, domain: str) -> str:
+        host = self._require_connected_host(hostname)
+        return host.get_domain_xml(domain)
 
     def control_domain(self, hostname: str, domain: str, action: str) -> bool:
         host = self._require_connected_host(hostname)

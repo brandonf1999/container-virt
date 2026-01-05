@@ -15,6 +15,7 @@ from ..errors import (
     DomainDeviceNotFoundError,
     DomainExistsError,
     DomainNotFoundError,
+    DomainNotRunningError,
     StorageError,
 )
 from ..storage import _detect_pool_type
@@ -23,6 +24,16 @@ if TYPE_CHECKING:
     from ..host import LibvirtHost
 
 logger = logging.getLogger(__name__)
+
+_SHARED_STORAGE_POOL_TYPES = {
+    "netfs",
+    "gluster",
+    "rbd",
+    "sheepdog",
+    "iscsi",
+}
+_DEFAULT_INTERFACE_MTU = 1500
+_MAX_VHOST_QUEUES = 8
 
 
 class LibvirtDomainLifecycle:
@@ -274,6 +285,129 @@ class LibvirtDomainLifecycle:
             "removed_volumes": removed_volumes,
         }
 
+    def migrate_guest(
+        self,
+        name: str,
+        target_host: "LibvirtHost",
+        *,
+        live: bool = True,
+        shared_storage: bool = True,
+        autostart: Optional[bool] = None,
+        tunnelled: Optional[bool] = None,
+        peer2peer: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        if not self._host._ensure_connection():  # pylint: disable=protected-access
+            raise RuntimeError(f"Not connected to {self._host.hostname}")
+        if not target_host._ensure_connection():  # pylint: disable=protected-access
+            raise RuntimeError(f"Not connected to {target_host.hostname}")
+
+        try:
+            domain = lookup_domain(self._host, self._should_retry, name)
+        except libvirt.libvirtError as exc:
+            logger.error("lookupByName(%s) failed on %s during migrate: %s", name, self._host.hostname, exc)
+            raise DomainNotFoundError(name) from exc
+
+        try:
+            is_active = bool(domain.isActive())
+        except libvirt.libvirtError:
+            is_active = False
+
+        if live and not is_active:
+            raise DomainNotRunningError(name)
+
+        if shared_storage:
+            try:
+                xml_desc = domain.XMLDesc(0)
+            except libvirt.libvirtError as exc:
+                logger.error("XMLDesc failed for %s on %s during migrate: %s", name, self._host.hostname, exc)
+                raise StorageError(f"Failed to read domain XML for '{name}': {exc}") from exc
+            self._assert_shared_storage(xml_desc)
+
+        transport = target_host.migration_transport()
+        if tunnelled is None:
+            tunnelled = target_host.migration_opts.get("tunnelled")
+        if tunnelled is None:
+            tunnelled = transport == "ssh"
+        if peer2peer is None:
+            peer2peer = target_host.migration_opts.get("peer2peer")
+        if peer2peer is None:
+            peer2peer = True
+
+        flags = 0
+        if live:
+            flags |= getattr(libvirt, "VIR_MIGRATE_LIVE", 0)
+        if shared_storage:
+            flags |= getattr(libvirt, "VIR_MIGRATE_SHARED_DISK", 0)
+        flags |= getattr(libvirt, "VIR_MIGRATE_PERSIST_DEST", 0)
+        flags |= getattr(libvirt, "VIR_MIGRATE_UNDEFINE_SOURCE", 0)
+        if peer2peer:
+            flags |= getattr(libvirt, "VIR_MIGRATE_PEER2PEER", 0)
+        if tunnelled:
+            flags |= getattr(libvirt, "VIR_MIGRATE_TUNNELLED", 0)
+
+        dest_uri = target_host.migration_uri()
+        logger.info(
+            "Live migration settings for %s: transport=%s peer2peer=%s tunnelled=%s dest_uri=%s",
+            name,
+            transport,
+            bool(peer2peer),
+            bool(tunnelled),
+            dest_uri,
+        )
+        try:
+            if hasattr(domain, "migrateToURI3"):
+                params: Dict[str, Any] = {}
+                domain.migrateToURI3(dest_uri, params, flags)
+            else:
+                domain.migrateToURI(dest_uri, flags, None, 0)
+        except libvirt.libvirtError as exc:
+            logger.error(
+                "Failed to migrate domain %s from %s to %s: %s",
+                name,
+                self._host.hostname,
+                target_host.hostname,
+                exc,
+            )
+            raise StorageError(f"Failed to live migrate domain '{name}': {exc}") from exc
+
+        target_domain = None
+        try:
+            target_domain = target_host.conn.lookupByName(name)  # type: ignore[union-attr]
+        except libvirt.libvirtError as exc:
+            logger.debug("lookupByName(%s) failed on target %s after migrate: %s", name, target_host.hostname, exc)
+
+        if target_domain is not None and isinstance(autostart, bool):
+            try:
+                target_domain.setAutostart(autostart)
+            except libvirt.libvirtError as exc:
+                logger.debug(
+                    "setAutostart failed for %s on %s after migrate: %s",
+                    name,
+                    target_host.hostname,
+                    exc,
+                )
+
+        started = is_active
+        if target_domain is not None:
+            try:
+                started = bool(target_domain.isActive())
+            except libvirt.libvirtError:
+                started = is_active
+
+        uuid_text = None
+        if target_domain is not None:
+            try:
+                uuid_text = target_domain.UUIDString()
+            except libvirt.libvirtError:
+                uuid_text = None
+
+        return {
+            "host": target_host.hostname,
+            "domain": name,
+            "uuid": uuid_text,
+            "started": started,
+        }
+
     def detach_guest_block_device(self, name: str, target: str) -> Dict[str, Any]:
         if not target:
             raise DomainDeviceNotFoundError(name, target)
@@ -394,6 +528,7 @@ class LibvirtDomainLifecycle:
         *,
         vcpus: int,
         memory_mb: int,
+        cpu_mode: str = "host-model",
         autostart: bool,
         start: bool,
         description: Optional[str],
@@ -421,6 +556,9 @@ class LibvirtDomainLifecycle:
             raise StorageError("Memory must be greater than zero")
         if not volumes:
             raise StorageError("At least one volume is required")
+        normalized_cpu_mode = (cpu_mode or "host-model").strip().lower()
+        if normalized_cpu_mode not in {"host-model", "host-passthrough"}:
+            raise StorageError("CPU mode must be host-model or host-passthrough")
 
         normalized_vnc_password = (vnc_password or "").strip()
         if enable_vnc is True and not normalized_vnc_password:
@@ -620,6 +758,12 @@ class LibvirtDomainLifecycle:
                 if mac_addr:
                     iface_parts.append(f"<mac address='{escape(mac_addr)}'/>")
                 iface_parts.append(f"<model type='{escape(model_type)}'/>")
+                if str(model_type).startswith("virtio"):
+                    queue_count = max(min(vcpus, _MAX_VHOST_QUEUES), 1)
+                    iface_parts.append(f"<driver name='vhost' queues='{queue_count}'/>")
+                iface_parts.append("<link state='up'/>")
+                if _DEFAULT_INTERFACE_MTU:
+                    iface_parts.append(f"<mtu size='{_DEFAULT_INTERFACE_MTU}'/>")
                 iface_parts.append("</interface>")
                 devices_xml_parts.append("".join(iface_parts))
 
@@ -644,16 +788,28 @@ class LibvirtDomainLifecycle:
             )
 
             os_boot_entries = []
-            if any(d.get("boot") for d in disk_specs):
+            disk_boot = any(d.get("boot") for d in disk_specs)
+            cd_boot = any(cd.get("boot") for cd in cd_specs)
+            if disk_specs and (disk_boot or cd_boot):
                 os_boot_entries.append("<boot dev='hd'/>")
-            if any(cd.get("boot") for cd in cd_specs):
+            if cd_boot:
                 os_boot_entries.append("<boot dev='cdrom'/>")
             if not os_boot_entries:
-                os_boot_entries.append("<boot dev='hd'/>")
+                if disk_specs:
+                    os_boot_entries.append("<boot dev='hd'/>")
+                elif cd_specs:
+                    os_boot_entries.append("<boot dev='cdrom'/>")
+                else:
+                    os_boot_entries.append("<boot dev='hd'/>")
 
             description_fragment = (
                 f"<description>{escape(description)}</description>" if description else ""
             )
+
+            if normalized_cpu_mode == "host-passthrough":
+                cpu_xml = "<cpu mode='host-passthrough' check='none'/>"
+            else:
+                cpu_xml = "<cpu mode='host-model'/>"
 
             domain_xml = (
                 "<domain type='kvm'>"
@@ -663,7 +819,7 @@ class LibvirtDomainLifecycle:
                 "<currentMemory unit='KiB'>{memory}</currentMemory>"
                 "<vcpu placement='static'>{vcpus}</vcpu>"
                 "<os><type arch='x86_64' machine='q35'>hvm</type>{boot}</os>"
-                "<cpu mode='host-passthrough' check='none'/>"
+                "{cpu}"
                 "<features><acpi/><apic/><pae/></features>"
                 "<clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>restart</on_crash>"
                 "<devices>{devices}</devices>"
@@ -674,6 +830,7 @@ class LibvirtDomainLifecycle:
                 memory=memory_kib,
                 vcpus=vcpus,
                 boot="".join(os_boot_entries),
+                cpu=cpu_xml,
                 devices="".join(devices_xml_parts),
             )
 
@@ -723,9 +880,120 @@ class LibvirtDomainLifecycle:
                     )
             raise
 
+    def define_guest_from_xml(
+        self,
+        xml: str,
+        *,
+        start: bool = False,
+        autostart: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        if not xml or not xml.strip():
+            raise StorageError("Domain XML is required to define a guest")
+        if not self._host._ensure_connection():  # pylint: disable=protected-access
+            raise RuntimeError(f"Not connected to {self._host.hostname}")
+
+        try:
+            domain = self._host.conn.defineXML(xml)  # type: ignore[union-attr]
+        except libvirt.libvirtError as exc:
+            logger.error("defineXML failed on %s: %s", self._host.hostname, exc)
+            raise StorageError(f"Failed to define domain: {exc}") from exc
+
+        if autostart is not None:
+            try:
+                domain.setAutostart(1 if autostart else 0)
+            except libvirt.libvirtError as exc:
+                logger.debug("setAutostart failed for %s on %s: %s", domain.name(), self._host.hostname, exc)
+
+        started = False
+        if start:
+            try:
+                domain.create()
+                started = True
+            except libvirt.libvirtError as exc:
+                logger.error("Failed to start domain %s on %s after define: %s", domain.name(), self._host.hostname, exc)
+                raise StorageError(f"Domain defined but failed to start: {exc}") from exc
+
+        uuid_text = None
+        try:
+            uuid_text = domain.UUIDString()
+        except libvirt.libvirtError:
+            uuid_text = None
+
+        details = None
+        if self._detail_resolver:
+            try:
+                details = self._detail_resolver(domain.name())
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.debug("detail resolver failed for %s on %s: %s", domain.name(), self._host.hostname, exc)
+
+        result: Dict[str, Any] = {
+            "host": self._host.hostname,
+            "domain": domain.name(),
+            "uuid": uuid_text,
+            "started": started,
+        }
+        if details is not None:
+            result["details"] = details
+        return result
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _assert_shared_storage(self, xml_desc: str) -> None:
+        try:
+            root = ET.fromstring(xml_desc)
+        except ET.ParseError as exc:
+            raise StorageError(f"Failed to parse domain XML for shared storage check: {exc}") from exc
+
+        non_shared: List[str] = []
+        for disk in root.findall("./devices/disk"):
+            device_type = (disk.get("device") or "").lower()
+            if device_type != "disk":
+                continue
+            source = disk.find("source")
+            if source is None:
+                continue
+            disk_type = (disk.get("type") or "").lower()
+            if disk_type == "network" or source.get("protocol"):
+                continue
+
+            pool_name = source.get("pool")
+            if pool_name:
+                try:
+                    pool = self._host.conn.storagePoolLookupByName(pool_name)  # type: ignore[union-attr]
+                except libvirt.libvirtError:
+                    pool = None
+                pool_type = _detect_pool_type(pool) if pool is not None else None
+                if pool_type in _SHARED_STORAGE_POOL_TYPES:
+                    continue
+                non_shared.append(f"{pool_name} (pool type {pool_type or 'unknown'})")
+                continue
+
+            path = source.get("file") or source.get("dev")
+            if not path:
+                non_shared.append("unresolved disk source")
+                continue
+            pool = self._resolve_pool_for_path(path)
+            pool_type = _detect_pool_type(pool) if pool is not None else None
+            if pool_type in _SHARED_STORAGE_POOL_TYPES:
+                continue
+            non_shared.append(f"{path} (pool type {pool_type or 'unknown'})")
+
+        if non_shared:
+            allowed = ", ".join(sorted(_SHARED_STORAGE_POOL_TYPES))
+            joined = "; ".join(non_shared)
+            raise StorageError(
+                "Live migration requires shared storage; non-shared disks: "
+                f"{joined}. Allowed pool types: {allowed}."
+            )
+
+    def _resolve_pool_for_path(self, path: str) -> Optional[libvirt.virStoragePool]:
+        try:
+            volume = self._host.conn.storageVolLookupByPath(path)  # type: ignore[union-attr]
+        except libvirt.libvirtError:
+            return None
+        return self._resolve_pool_for_volume(volume, path)
 
     def _resolve_pool_for_volume(
         self,

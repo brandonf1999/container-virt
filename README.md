@@ -44,6 +44,9 @@ hosts:
     user: admin
     ssh:
       known_hosts_verify: ignore
+    migration:
+      transport: tcp
+      port: 16509
 ```
 Place SSH material for the `user` accounts under `.ssh/` (ignored by git). The default container setup mounts this directory at `/home/virt/.ssh`.
 
@@ -91,6 +94,13 @@ Run `go-task db:revision MESSAGE="storage topology"` after you adjust the ORM mo
 ### Storage APIs
 - `GET /api/cluster/storage` – legacy per-host inventory plus a `storage_domains` array sourced from the database (each entry includes host summaries).
 - `GET /api/storage/{uuid}` – detailed view for a single storage domain showing host mount status and capacity metrics.
+
+### Live Migration Requirements
+- Guests must use shared storage pools such as `netfs`, `gluster`, `rbd`, `sheepdog`, or `iscsi` on both hosts.
+- Source and target hypervisors need compatible CPU models, network bridges, and libvirt versions to accept live migration.
+- Live migrations are attempted by default when a guest is running; choose cold migration for local-only disks.
+- The default migration transport is `qemu+tcp` (no tunnel). Ensure libvirtd listens on TCP and firewalls allow the port.
+- To use SSH tunnelling instead, set `migration.transport: ssh` and optionally `migration.tunnelled: true`.
 
 ### Tests & Linting
 Run the project's test suite (once available) with `pytest`. Ensure any new libvirt interactions are covered by unit or integration tests before pushing changes.

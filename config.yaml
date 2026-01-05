@@ -18,9 +18,14 @@ hosts:
     user: admin
     ssh:
       known_hosts_verify: ignore
+    migration:
+      transport: tcp
+      port: 16509
   - hostname: virt0002.foos.net
     user: admin
     ssh:
       known_hosts_verify: ignore
-
+    migration:
+      transport: tcp
+      port: 16509
 
